@@ -1,0 +1,26 @@
+name: Build and Test on macOS
+
+on: [push]
+
+jobs:
+  build_and_test:
+    runs-on: macos-latest
+
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+
+    - name: Install Dependencies
+      run: |
+        brew install gcc openssl@3 ninja
+
+    - name: Setup Environment Variables
+      run: |
+        echo "CC=gcc" >> $GITHUB_ENV
+        echo "OPENSSL_INCLUDES=-I$(brew --prefix openssl@3)/include" >> $GITHUB_ENV
+        echo "OPENSSL_LIBS=-L$(brew --prefix openssl@3)/lib -lssl -lcrypto" >> $GITHUB_ENV
+
+    - name: Build and Test with Ninja
+      run: |
+        ninja
