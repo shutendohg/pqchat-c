@@ -1,4 +1,4 @@
-# pqchat-c - Pure-PQC TLS Echo (OpenSSL 3.5 / MLKEM768 + ML-DSA-65)
+# pqchat-c 
 
 [![CI](https://github.com/shutendohg/pqchat-c/actions/workflows/ci.yml/badge.svg)](https://github.com/shutendohg/pqchat-c/actions/workflows/ci.yml)
 
