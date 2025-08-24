@@ -56,7 +56,7 @@ int main(int argc, char **argv) {
     if (n <= 0)
       break;
     buf[n] = 0;
-    printf("echo:%s", buf);
+    printf("echo: %s", buf);
     if (one_shot)
       break;
   }
