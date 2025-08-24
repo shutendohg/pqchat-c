@@ -14,6 +14,8 @@ static int listen6_any(void) {
     perror("socket");
     return -1;
   }
+  int on = 1;
+  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
   int off = 0;
   setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
   struct sockaddr_in6 a = {0};

@@ -57,6 +57,17 @@ TLS_CTX *tls_ctx_new_client(void) {
     SSL_CTX_free(c);
     return NULL;
   }
+  /* Validate Server certification if there is cert/ca.crt */
+  if (access("cert/ca.crt", R_OK) == 0) {
+    if (SSL_CTX_load_verify_locations(c, "cert/ca.crt", NULL) != 1) {
+      fprintf(stderr, "[openssl] load CA faield\n");
+      ERR_print_errors_fp(stderr);
+      SSL_CTX_free(c);
+      free(r);
+      return NULL;
+    }
+    SSL_CTX_set_verify(c, SSL_VERIFY_PEER, NULL);
+  }
   r->ctx = c;
   return r;
 }
