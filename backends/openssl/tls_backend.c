@@ -1,6 +1,7 @@
 #include "tls_backend.h"
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <openssl/x509v3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -67,6 +68,11 @@ TLS_CTX *tls_ctx_new_client(void) {
       return NULL;
     }
     SSL_CTX_set_verify(c, SSL_VERIFY_PEER, NULL);
+    /* Validate hostname = localhost */
+    X509_VERIFY_PARAM *param = SSL_CTX_get0_param(c);
+    X509_VERIFY_PARAM_set_hostflags(param,
+                                    X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+    X509_VERIFY_PARAM_set1_host(param, "localhost", 0);
   }
   r->ctx = c;
   return r;

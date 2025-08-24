@@ -1,28 +1,50 @@
-TLS_BACKEND ?= openssl
+# ---- toolchain ---------------------------------------------------------------
+CC      ?= cc
+CSTD    ?= -std=c11
+CFLAGS  ?= -O2 -Wall -Wextra
+CPPFLAGS+= -Iinclude
 
-CFLAGS = -std=c11 -O2 -Wall -Wextra -Iinclude
-LDFLAGS =
+# ---- OpenSSL 3.5 location (override by: make OPENSSL_PREFIX=/path/to/ossl-3.5)
+OPENSSL_PREFIX ?= $(HOME)/opt/openssl-3.5
+# Prefer lib64 if present, otherwise lib
+OPENSSL_LIBDIR  := $(shell if [ -d "$(OPENSSL_PREFIX)/lib64" ]; then echo "$(OPENSSL_PREFIX)/lib64"; else echo "$(OPENSSL_PREFIX)/lib"; fi)
 
-ifeq ($(TLS_BACKEND), openssl)
-	CFLAGS += $(shell pkg-config --cflags openssl)
-	LDFLAGS += $(shell pkg-config --libs openssl)
-	BACKEND_SRC = backends/openssl/tls_backend.c
-	BACKEND_OBJ = $(BACKEND_SRC:.c=.o)
-else
-	$(error Unsupported TLS_BACKEND=$(TLS_BACKEND))
-endif
+# Link against 3.5 libs and embed RPATH so runtime uses them
+LDFLAGS += -L$(OPENSSL_LIBDIR) -Wl,-rpath,$(OPENSSL_LIBDIR)
+LDLIBS  += -lssl -lcrypto
 
+# ---- sources -----------------------------------------------------------------
+SRCS_SERVER = src/server.c backends/openssl/tls_backend.c
+SRCS_CLIENT = src/client.c backends/openssl/tls_backend.c
+OBJS_SERVER = $(SRCS_SERVER:.c=.o)
+OBJS_CLIENT = $(SRCS_CLIENT:.c=.o)
+
+# ---- default -----------------------------------------------------------------
+.PHONY: all
 all: server client
-server: src/server.o $(BACKEND_OBJ)
-	$(CC) -o $@ $^ $(LDFLAGS)
-client: src/client.o $(BACKEND_OBJ)
-	$(CC) -o $@ $^ $(LDFLAGS)
+
+# ---- build rules --------------------------------------------------------------
+server: $(OBJS_SERVER)
+	$(CC) $(OBJS_SERVER) $(LDFLAGS) $(LDLIBS) -o $@
+
+client: $(OBJS_CLIENT)
+	$(CC) $(OBJS_CLIENT) $(LDFLAGS) $(LDLIBS) -o $@
+
+%.o: %.c
+	$(CC) $(CPPFLAGS) $(CSTD) $(CFLAGS) -c $< -o $@
+
+# ---- helpers -----------------------------------------------------------------
+.PHONY: clean print-vars run-demo
 clean:
-	rm -rf src/*.o backends/*/*.o server client tests/test_tls
-.PHONY: all clean test-unit
+	rm -f src/*.o backends/*/*.o server client tests/test_tls
 
-test-unit: tests/test_tls
-	./tests/test_tls
+print-vars:
+	@echo "OPENSSL_PREFIX=$(OPENSSL_PREFIX)"
+	@echo "OPENSSL_LIBDIR=$(OPENSSL_LIBDIR)"
 
-tests/test_tls: tests/test_tls.c backends/openssl/tls_backend.openssl
-	$(CC) -o $@ $^ $(CFLAGS) $(LDFLAGS)
+# Quick demo (adds OPENSSL_MODULES for provider discovery)
+run-demo: server client
+	OPENSSL_MODULES="$(OPENSSL_LIBDIR)/ossl-modules" ./server & pid=$$!; \
+	sleep 1; \
+	printf "hello\n" | OPENSSL_MODULES="$(OPENSSL_LIBDIR)/ossl-modules" ./client; \
+	kill $$pid || true
