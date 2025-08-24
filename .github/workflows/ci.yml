@@ -1,17 +1,14 @@
 name: pqchat-c CI
-
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-24.04  
+    runs-on: ubuntu-24.04
     env:
       OPENSSL_PREFIX: ${{ github.workspace }}/opt/openssl-3.5
-      PATH: ${{ github.workspace }}/opt/openssl-3.5/bin:${{ env.PATH }}
-      LD_LIBRARY_PATH: ${{ github.workspace }}/opt/openssl-3.5/lib
-      OPENSSL_MODULES: ${{ github.workspace }}/opt/openssl-3.5/lib/ossl-modules
     steps:
       - uses: actions/checkout@v4
 
@@ -33,11 +30,19 @@ jobs:
           git clone --depth=1 --branch openssl-3.5.0 https://github.com/openssl/openssl.git
           cd openssl
           ./Configure --prefix="${OPENSSL_PREFIX}" linux-x86_64
-          make -j$(nproc)
+          make -j"$(nproc)"
           make install_sw
+
+      - name: Export OpenSSL into PATH and env
+        run: |
+          echo "${OPENSSL_PREFIX}/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=${OPENSSL_PREFIX}/lib" >> "$GITHUB_ENV"
+          echo "OPENSSL_MODULES=${OPENSSL_PREFIX}/lib/ossl-modules" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=${OPENSSL_PREFIX}/lib/pkgconfig" >> "$GITHUB_ENV"
 
       - name: Show openssl version and groups
         run: |
+          which openssl
           openssl version -a
           openssl list -tls-groups | tr '\n' ' ' | sed 's/  */ /g'
 
@@ -48,14 +53,14 @@ jobs:
       - name: Build project
         run: |
           make clean
-          PKG_CONFIG_PATH="${OPENSSL_PREFIX}/lib/pkgconfig" make V=1
+          make
           ldd ./server | egrep 'ssl|crypto'
           ldd ./client | egrep 'ssl|crypto'
 
       - name: Smoke test (self client)
         run: |
           set -e
-          ./server & # execute as background
+          ./server &
           PID=$!
           sleep 1
           printf "hello\n" | ./client | tee /tmp/out.txt
