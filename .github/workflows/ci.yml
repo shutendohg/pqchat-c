@@ -1,26 +1,72 @@
-name: Build and Test on macOS
+name: pqchat-c CI
 
-on: [push]
+on:
+  push:
+  pull_request:
 
 jobs:
-  build_and_test:
-    runs-on: macos-latest
-
+  build-and-test:
+    runs-on: ubuntu-24.04  
+    env:
+      OPENSSL_PREFIX: ${{ github.workspace }}/opt/openssl-3.5
+      PATH: ${{ github.workspace }}/opt/openssl-3.5/bin:${{ env.PATH }}
+      LD_LIBRARY_PATH: ${{ github.workspace }}/opt/openssl-3.5/lib
+      OPENSSL_MODULES: ${{ github.workspace }}/opt/openssl-3.5/lib/ossl-modules
     steps:
-    - uses: actions/checkout@v3
-      with:
-        fetch-depth: 0
+      - uses: actions/checkout@v4
 
-    - name: Install Dependencies
-      run: |
-        brew install gcc openssl@3 ninja
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential perl git ca-certificates pkg-config
 
-    - name: Setup Environment Variables
-      run: |
-        echo "CC=gcc" >> $GITHUB_ENV
-        echo "OPENSSL_INCLUDES=-I$(brew --prefix openssl@3)/include" >> $GITHUB_ENV
-        echo "OPENSSL_LIBS=-L$(brew --prefix openssl@3)/lib -lssl -lcrypto" >> $GITHUB_ENV
+      - name: Cache OpenSSL 3.5 build
+        id: cache-ossl
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OPENSSL_PREFIX }}
+          key: ossl-3.5.0-${{ runner.os }}-v1
 
-    - name: Build and Test with Ninja
-      run: |
-        ninja
+      - name: Build & install OpenSSL 3.5.0 (if cache miss)
+        if: steps.cache-ossl.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 --branch openssl-3.5.0 https://github.com/openssl/openssl.git
+          cd openssl
+          ./Configure --prefix="${OPENSSL_PREFIX}" linux-x86_64
+          make -j$(nproc)
+          make install_sw
+
+      - name: Show openssl version and groups
+        run: |
+          openssl version -a
+          openssl list -tls-groups | tr '\n' ' ' | sed 's/  */ /g'
+
+      - name: Generate test certs (ML-DSA-65)
+        run: |
+          OPENSSL=openssl ./scripts/gen_certs.sh
+
+      - name: Build project
+        run: |
+          make clean
+          PKG_CONFIG_PATH="${OPENSSL_PREFIX}/lib/pkgconfig" make V=1
+          ldd ./server | egrep 'ssl|crypto'
+          ldd ./client | egrep 'ssl|crypto'
+
+      - name: Smoke test (self client)
+        run: |
+          set -e
+          ./server & # execute as background
+          PID=$!
+          sleep 1
+          printf "hello\n" | ./client | tee /tmp/out.txt
+          kill $PID
+          grep -q "echo: hello" /tmp/out.txt
+
+      - name: Smoke test (openssl s_client)
+        run: |
+          ./server &
+          PID=$!
+          sleep 1
+          openssl s_client -connect [::1]:4433 -tls1_3 -groups MLKEM768 -CAfile cert/ca.crt </dev/null 2>&1 | tee /tmp/sclient.txt || true
+          kill $PID
+          grep -q "Negotiated TLS1.3 group: MLKEM768" /tmp/sclient.txt
