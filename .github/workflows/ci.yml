@@ -1,21 +1,37 @@
 name: pqchat-c CI
+
 on:
   push:
   pull_request:
-  workflow_dispatch:
 
 jobs:
   build-and-test:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [openssl, wolfssl]   # run both backends
     env:
+      BACKEND: ${{ matrix.backend }}
       OPENSSL_PREFIX: ${{ github.workspace }}/opt/openssl-3.5
+      WOLFSSL_PREFIX: ${{ github.workspace }}/opt/wolfssl
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential perl git ca-certificates pkg-config patchelf
+          sudo apt-get install -y build-essential perl git ca-certificates pkg-config autoconf automake libtool
+
+      - name: Compute libdirs and PKG_CONFIG_PATH
+        run: |
+          # Compute lib paths (lib64 preferred if exists)
+          if [ -d "${OPENSSL_PREFIX}/lib64" ]; then echo "OPENSSL_LIBDIR=${OPENSSL_PREFIX}/lib64" >> $GITHUB_ENV; else echo "OPENSSL_LIBDIR=${OPENSSL_PREFIX}/lib" >> $GITHUB_ENV; fi
+          if [ -d "${WOLFSSL_PREFIX}/lib64" ]; then echo "WOLFSSL_LIBDIR=${WOLFSSL_PREFIX}/lib64" >> $GITHUB_ENV; else echo "WOLFSSL_LIBDIR=${WOLFSSL_PREFIX}/lib" >> $GITHUB_ENV; fi
+          echo "PKG_CONFIG_PATH=${WOLFSSL_PREFIX}/lib/pkgconfig:${WOLFSSL_PREFIX}/lib64/pkgconfig:${PKG_CONFIG_PATH}" >> $GITHUB_ENV
+
+      # ---- OpenSSL 3.5 ------------------------------------------------------
 
       - name: Cache OpenSSL 3.5 build
         id: cache-ossl
@@ -24,87 +40,89 @@ jobs:
           path: ${{ env.OPENSSL_PREFIX }}
           key: ossl-3.5.0-${{ runner.os }}-v1
 
-      # ← キャッシュに頼り切らず、実体が無ければ必ずビルド
-      - name: Ensure OpenSSL 3.5 installed
+      - name: Build & install OpenSSL 3.5.0 (if cache miss)
+        if: steps.cache-ossl.outputs.cache-hit != 'true'
         run: |
-          if [ ! -x "${OPENSSL_PREFIX}/bin/openssl" ]; then
-            echo "OpenSSL not found; building..."
-            git clone --depth=1 --branch openssl-3.5.0 https://github.com/openssl/openssl.git
-            cd openssl
-            ./Configure --prefix="${OPENSSL_PREFIX}" linux-x86_64
-            make -j"$(nproc)"
-            make install_sw
-          else
-            echo "OpenSSL already present:"
-            "${OPENSSL_PREFIX}/bin/openssl" version -a || true
+          git clone --depth=1 --branch openssl-3.5.0 https://github.com/openssl/openssl.git
+          cd openssl
+          ./Configure --prefix="${OPENSSL_PREFIX}" linux-x86_64
+          make -j"$(nproc)"
+          make install_sw
+
+      - name: Show OpenSSL version and PQC groups (for s_client)
+        run: |
+          LD_LIBRARY_PATH="${OPENSSL_LIBDIR}" \
+          OPENSSL_MODULES="${OPENSSL_LIBDIR}/ossl-modules" \
+          "${OPENSSL_PREFIX}/bin/openssl" version -a
+          LD_LIBRARY_PATH="${OPENSSL_LIBDIR}" \
+          OPENSSL_MODULES="${OPENSSL_LIBDIR}/ossl-modules" \
+          "${OPENSSL_PREFIX}/bin/openssl" list -tls-groups | tr '\n' ' ' | sed 's/  */ /g'
+
+      # ---- wolfSSL (only on backend=wolfssl) --------------------------------
+
+      - name: Cache wolfSSL build
+        if: matrix.backend == 'wolfssl'
+        id: cache-wolf
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WOLFSSL_PREFIX }}
+          key: wolfssl-main-kyber-dilithium-${{ runner.os }}-v1
+
+      - name: Build & install wolfSSL (Kyber/Dilithium)
+        if: matrix.backend == 'wolfssl' && steps.cache-wolf.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 https://github.com/wolfSSL/wolfssl.git
+          cd wolfssl
+          # autogen may be needed on some snapshots; ignore if configure already exists
+          ([ -f configure ] || ./autogen.sh) || true
+          ./configure --prefix="${WOLFSSL_PREFIX}" --enable-tls13 --enable-kyber --enable-dilithium
+          make -j"$(nproc)"
+          make install
+
+      # ---- Certs & Build project --------------------------------------------
+
+      - name: Generate test certs (ML-DSA-65) if missing
+        run: |
+          if [ ! -f cert/srv.crt ]; then
+            OPENSSL="${OPENSSL_PREFIX}/bin/openssl" \
+            OPENSSL_CONF="${GITHUB_WORKSPACE}/openssl.cnf" \
+            ./scripts/gen_certs.sh
           fi
 
-      # ← lib と modules の実在パスを自動検出（lib or lib64）
-      - name: Detect OpenSSL libdir
-        run: |
-          set -e
-          LIBDIR="${OPENSSL_PREFIX}/lib"
-          if [ ! -f "${LIBDIR}/libcrypto.so.3" ]; then
-            LIBDIR="$(dirname "$(find "${OPENSSL_PREFIX}" -name 'libcrypto.so.3' -print -quit)")"
-          fi
-          [ -n "${LIBDIR}" ] && [ -d "${LIBDIR}" ] || { echo "libdir not found"; exit 1; }
-          MODDIR="${LIBDIR}/ossl-modules"
-          echo "LIBDIR=${LIBDIR}"   >> "$GITHUB_ENV"
-          echo "MODDIR=${MODDIR}"   >> "$GITHUB_ENV"
-          echo "${OPENSSL_PREFIX}/bin" >> "$GITHUB_PATH"
-          echo "LD_LIBRARY_PATH=${LIBDIR}" >> "$GITHUB_ENV"
-          echo "OPENSSL_MODULES=${MODDIR}" >> "$GITHUB_ENV"
-          echo "PKG_CONFIG_PATH=${LIBDIR}/pkgconfig" >> "$GITHUB_ENV"
-          echo "Detected LIBDIR=$LIBDIR"
-          ls -l "$LIBDIR" || true
-          ls -l "$MODDIR" || true
-
-      - name: Force RPATH on openssl
-        run: |
-          patchelf --set-rpath "${LIBDIR}" "${OPENSSL_PREFIX}/bin/openssl"
-          ldd "${OPENSSL_PREFIX}/bin/openssl" | egrep 'ssl|crypto'
-
-      - name: Show openssl version and groups
-        run: |
-          which openssl
-          ldd "$(which openssl)" | egrep 'ssl|crypto'
-          openssl version -a
-          openssl list -tls-groups | tr '\n' ' ' | sed 's/  */ /g'
-
-      - name: Generate test certs (ML-DSA-65)
-        run: |
-          OPENSSL=openssl ./scripts/gen_certs.sh
-
-      - name: Build project
+      - name: Build project (${{ matrix.backend }})
         run: |
           make clean
-          make
-          ldd ./server | egrep 'ssl|crypto'
-          ldd ./client | egrep 'ssl|crypto'
+          make BACKEND="${BACKEND}" OPENSSL_PREFIX="${OPENSSL_PREFIX}" WOLFSSL_PREFIX="${WOLFSSL_PREFIX}"
 
-      # （任意）自作バイナリにも RPATH を入れて更に堅くする
-      - name: Force RPATH on project binaries
+      - name: ldd (server/client)
         run: |
-          patchelf --set-rpath "${LIBDIR}" ./server
-          patchelf --set-rpath "${LIBDIR}" ./client
-          ldd ./server | egrep 'ssl|crypto'
-          ldd ./client | egrep 'ssl|crypto'
+          ldd ./server | egrep 'ssl|crypto' || true
+          ldd ./client | egrep 'ssl|crypto' || true
 
-      - name: Smoke test (self client)
+      # ---- Smoke test --------------------------------------------------------
+
+      - name: Smoke test (${{ matrix.backend }})
+        shell: bash
         run: |
           set -e
-          ./server &
-          PID=$!
-          sleep 1
-          printf "hello\n" | ./client | tee /tmp/out.txt
-          kill $PID
-          grep -Eq 'echo:[[:space:]]*hello' /tmp/out.txt
+          # Runtime search paths
+          export LD_LIBRARY_PATH="${OPENSSL_LIBDIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+          if [ "${BACKEND}" = "wolfssl" ]; then
+            export LD_LIBRARY_PATH="${WOLFSSL_LIBDIR}:${LD_LIBRARY_PATH}"
+          fi
+          export OPENSSL_MODULES="${OPENSSL_LIBDIR}/ossl-modules"
 
-      - name: Smoke test (openssl s_client)
-        run: |
+          # Start server
           ./server &
           PID=$!
           sleep 1
-          openssl s_client -connect [::1]:4433 -tls1_3 -groups MLKEM768 -CAfile cert/ca.crt </dev/null 2>&1 | tee /tmp/sclient.txt || true
-          kill $PID
-          grep -q "Negotiated TLS1.3 group: MLKEM768" /tmp/sclient.txt
+
+          # s_client handshake check (pure MLKEM768)
+          timeout 10 "${OPENSSL_PREFIX}/bin/openssl" s_client -connect [::1]:4433 -tls1_3 -groups MLKEM768 -CAfile cert/ca.crt </dev/null | tee /tmp/s_client.txt
+          grep -q "Negotiated TLS1.3 group: MLKEM768" /tmp/s_client.txt
+
+          # one round trip via our client
+          printf "hello\n" | ./client | tee /tmp/out.txt
+          kill $PID || true
+
+          grep -Eq "^echo: ?hello$" /tmp/out.txt
