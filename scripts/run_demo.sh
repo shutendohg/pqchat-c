@@ -1,74 +1,103 @@
 #!/usr/bin/env bash
-# Demo runner:
-# - Detect OpenSSL 3.5 prefix (lib/lib64)
-# - Build project (link against 3.5 and embed RPATH via Makefile)
-# - Generate PQC certs if missing (ML-DSA-65)
-# - Verify pure-PQC negotiation with s_client (MLKEM768)
-# - Echo roundtrip using our client
+# run_demo.sh - local smoke demo for pqchat-c
+# Supports BACKEND=openssl (default) or BACKEND=wolfssl
+# This script:
+#   1) prints OpenSSL 3.5 info (used for s_client and cert gen)
+#   2) builds the project with selected BACKEND
+#   3) generates demo certs if missing (ML-DSA-65)
+#   4) starts server, verifies handshake via OpenSSL s_client (MLKEM768)
+#   5) runs custom client for one echo round trip
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
 
-# Detect OpenSSL 3.5 location (override by OPENSSL_PREFIX=/path/to/ossl-3.5)
-PREFIX="${OPENSSL_PREFIX:-$HOME/opt/openssl-3.5}"
-OPENSSL="${OPENSSL:-$PREFIX/bin/openssl}"
+# ---- config (can be overridden by env) ---------------------------------------
+BACKEND="${BACKEND:-openssl}" # openssl | wolfssl
+OPENSSL_PREFIX="${OPENSSL_PREFIX:-$HOME/opt/openssl-3.5}"
+WOLFSSL_PREFIX="${WOLFSSL_PREFIX:-/usr/local}"
 
-# Pick lib or lib64
-LIBDIR="$PREFIX/lib"
-[[ -f "$LIBDIR/libcrypto.so.3" ]] || LIBDIR="$PREFIX/lib64"
-if [[ ! -f "$LIBDIR/libcrypto.so.3" ]]; then
-    echo "[demo][ERR] libcrypto.so.3 not found under $PREFIX"
-    echo "           Set OPENSSL_PREFIX to the correct OpenSSL 3.5 prefix."
+# pick lib64 if exists
+libdir() {
+    local p="$1"
+    if [ -d "$p/lib64" ]; then echo "$p/lib64"; else echo "$p/lib"; fi
+}
+OSSL_LIBDIR="$(libdir "$OPENSSL_PREFIX")"
+WOLF_LIBDIR="$(libdir "$WOLFSSL_PREFIX")"
+
+echo "[demo] BACKEND=${BACKEND}"
+echo "[demo] OPENSSL_PREFIX=${OPENSSL_PREFIX}"
+echo "[demo] WOLFSSL_PREFIX=${WOLFSSL_PREFIX}"
+
+# ---- step 0: OpenSSL 3.5 presence (for s_client & certs) ---------------------
+OPENSSL="${OPENSSL_PREFIX}/bin/openssl"
+if [ ! -x "${OPENSSL}" ]; then
+    echo "[demo] ERROR: ${OPENSSL} not found. Build or set OPENSSL_PREFIX." >&2
     exit 1
 fi
 
-# Make runtime pick our libs/providers (even if RPATH exists, this is safer)
-export LD_LIBRARY_PATH="$LIBDIR${LD_LIBRARY_PATH+:$LD_LIBRARY_PATH}"
-export OPENSSL_MODULES="$LIBDIR/ossl-modules"
-export PKG_CONFIG_PATH="$LIBDIR/pkgconfig"
-export PATH="$PREFIX/bin:$PATH"
+echo "[demo] OpenSSL version:"
+env LD_LIBRARY_PATH="${OSSL_LIBDIR}" \
+    OPENSSL_MODULES="${OSSL_LIBDIR}/ossl-modules" \
+    "${OPENSSL}" version -a
 
-echo "[demo] OPENSSL=$OPENSSL"
-$OPENSSL version -a || true
-echo "[demo] TLS groups: $($OPENSSL list -tls-groups | tr '\n' ' ' | sed 's/  */ /g')" || true
+echo -n "[demo] TLS groups: "
+env LD_LIBRARY_PATH="${OSSL_LIBDIR}" \
+    OPENSSL_MODULES="${OSSL_LIBDIR}/ossl-modules" \
+    "${OPENSSL}" list -tls-groups | tr '\n' ' ' | sed 's/  */ /g'
+echo
 
-# Ensure MLKEM768 exists in this openssl build
-if ! $OPENSSL list -tls-groups | grep -q 'MLKEM768'; then
-    echo "[demo][ERR] This openssl does not support MLKEM768."
-    exit 1
-fi
-
-echo "[demo] building project..."
+# ---- step 1: build project ---------------------------------------------------
+echo "[demo] building project (BACKEND=${BACKEND})..."
 make -s clean
-make -s OPENSSL_PREFIX="$PREFIX"
+make -s BACKEND="${BACKEND}" OPENSSL_PREFIX="${OPENSSL_PREFIX}" WOLFSSL_PREFIX="${WOLFSSL_PREFIX}"
 
 echo "[demo] ldd (server/client)"
-ldd ./server | egrep 'ssl|crypto' || true
-ldd ./client | egrep 'ssl|crypto' || true
+ldd ./server | egrep 'ssl|crypto|wolfssl' || true
+ldd ./client | egrep 'ssl|crypto|wolfssl' || true
 
-# Generate certs if missing (server cert)
-if [[ ! -f cert/srv.crt ]]; then
-    echo "[demo] generating certificates..."
-    OPENSSL="$OPENSSL" ./scripts/gen_certs.sh
+# ---- step 2: generate certs if missing --------------------------------------
+if [ ! -f cert/srv.crt ]; then
+    echo "[demo] generating demo certificates..."
+    OPENSSL_CONF="$(pwd)/openssl.cnf"
+    if [ ! -f "${OPENSSL_CONF}" ]; then
+        echo "[demo] ERROR: openssl.cnf not found. Run repo root." >&2
+        exit 1
+    fi
+    OPENSSL="${OPENSSL}" OPENSSL_CONF="${OPENSSL_CONF}" ./scripts/gen_certs.sh
+else
+    echo "[demo] certs exist; skipping generation"
 fi
 
-# Start server and verify PQC-only negotiation
+# ---- step 3: start server with proper runtime env ----------------------------
+# For openssl backend: need OpenSSL's provider path
+# For wolfssl backend: need wolfSSL's lib at runtime (also OpenSSL lib for s_client next)
+echo "[demo] starting server..."
+if [ "${BACKEND}" = "openssl" ]; then
+    export LD_LIBRARY_PATH="${OSSL_LIBDIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    export OPENSSL_MODULES="${OSSL_LIBDIR}/ossl-modules"
+else
+    export LD_LIBRARY_PATH="${WOLF_LIBDIR}:${OSSL_LIBDIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    unset OPENSSL_MODULES || true
+fi
+
 ./server &
 PID=$!
-trap 'kill $PID 2>/dev/null || true' EXIT
+trap 'kill ${PID} 2>/dev/null || true' EXIT
 sleep 1
 
+# ---- step 4: verify handshake using OpenSSL s_client (pure MLKEM768) ---------
 echo "[demo] checking with openssl s_client..."
-$OPENSSL s_client -connect [::1]:4433 -tls1_3 -groups MLKEM768 \
-    -CAfile cert/ca.crt </dev/null 2>&1 | tee /tmp/sclient.txt || true
+env LD_LIBRARY_PATH="${OSSL_LIBDIR}" \
+    OPENSSL_MODULES="${OSSL_LIBDIR}/ossl-modules" \
+    "${OPENSSL}" s_client -connect [::1]:4433 -tls1_3 -groups MLKEM768 -CAfile cert/ca.crt </dev/null |
+    tee /tmp/s_client.txt
 
-if ! grep -q "Negotiated TLS1.3 group: MLKEM768" /tmp/sclient.txt; then
-    echo "[demo][ERR] Could not confirm MLKEM768 negotiation via s_client."
+grep -q "Negotiated TLS1.3 group: MLKEM768" /tmp/s_client.txt || {
+    echo "[demo] ERROR: MLKEM768 was not negotiated." >&2
     exit 1
-fi
+}
 
+# ---- step 5: one echo round trip --------------------------------------------
 echo "[demo] running self client..."
 printf "hello\n" | ./client | tee /tmp/out.txt
-grep -Eq 'echo:[[:space:]]*hello' /tmp/out.txt
-
+grep -Eq "^echo: ?hello$" /tmp/out.txt
 echo "[demo] OK ✅  (pure PQC: KEM=MLKEM768, sig=ML-DSA-65)"
